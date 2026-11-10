@@ -1,5 +1,11 @@
 # Outlander PHEV bridge
 
+---
+
+While you're here - check out [Amphora](https://getamphora.app) for checking your battery health on iOS.
+
+---
+
 Turns a Raspberry Pi into a bridge between a Mitsubishi Outlander PHEV and MQTT. The Pi
 joins the car's "Remote Control" wifi hotspot with a second (USB) wifi adapter and runs
 [phev2mqtt](https://github.com/buxtronix/phev2mqtt) with a few fixes. From MQTT the car
