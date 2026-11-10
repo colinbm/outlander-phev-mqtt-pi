@@ -1,0 +1,129 @@
+diff --git a/cmd/mqtt.go b/cmd/mqtt.go
+index d1538dd..062bf03 100644
+--- a/cmd/mqtt.go
++++ b/cmd/mqtt.go
+@@ -26,6 +26,7 @@ import (
+ 	"github.com/spf13/viper"
+ 	"os/exec"
+ 	"strings"
++	"sync"
+ 	"time"
+ 
+ 	mqtt "github.com/eclipse/paho.mqtt.golang"
+@@ -151,12 +152,43 @@ type mqttClient struct {
+ 	enabled bool
+ 
+ 	disableRegisterSet bool
++
++	availMu   sync.Mutex
++	available string // last published phev/available value
+ }
+ 
+ func (m *mqttClient) topic(topic string) string {
+ 	return fmt.Sprintf("%s%s", m.prefix, topic)
+ }
+ 
++// setAvailable publishes phev/available (retained) only when the value changes.
++func (m *mqttClient) setAvailable(state string) {
++	m.availMu.Lock()
++	defer m.availMu.Unlock()
++	if m.available == state {
++		return
++	}
++	m.available = state
++	m.client.Publish(m.topic("/available"), 0, true, state)
++}
++
++// onMqttConnect runs on every (re)connect to the broker: paho drops
++// subscriptions with a clean session, and the broker may have published our
++// "offline" will while we were away, so re-subscribe and re-assert availability.
++func (m *mqttClient) onMqttConnect(c mqtt.Client) {
++	for _, t := range []string{"/set/#", "/connection", "/settings/#"} {
++		if token := c.Subscribe(m.topic(t), 0, nil); token.Wait() && token.Error() != nil {
++			log.Errorf("Error subscribing to %s: %v", m.topic(t), token.Error())
++		}
++	}
++	m.availMu.Lock()
++	state := m.available
++	m.availMu.Unlock()
++	if state != "" {
++		c.Publish(m.topic("/available"), 0, true, state)
++	}
++}
++
+ func (m *mqttClient) Run(cmd *cobra.Command, args []string) error {
+ 	m.enabled = true // Default.
+ 
+@@ -185,27 +217,19 @@ func (m *mqttClient) Run(cmd *cobra.Command, args []string) error {
+ 		SetPassword(mqttPassword).
+ 		SetAutoReconnect(true).
+ 		SetDefaultPublishHandler(m.handleIncomingMqtt).
++		SetOnConnectHandler(m.onMqttConnect).
+ 		SetWill(m.topic("/available"), "offline", 0, true)
+ 
++	m.disableRegisterSet = mqttDisableSet
+ 	m.client = mqtt.NewClient(m.options)
+ 	if token := m.client.Connect(); token.Wait() && token.Error() != nil {
+ 		return token.Error()
+ 	}
+ 
+-	// Always subscribe to /set/#; the disable flag only blocks raw /set/register/ writes.
+-	m.disableRegisterSet = mqttDisableSet
++	// /set/# is always subscribed (in onMqttConnect); the flag only blocks raw /set/register/ writes.
+ 	if mqttDisableSet {
+ 		log.Info("Setting vechicle registers via MQTT is disabled")
+ 	}
+-	if token := m.client.Subscribe(m.topic("/set/#"), 0, nil); token.Wait() && token.Error() != nil {
+-		return token.Error()
+-	}
+-	if token := m.client.Subscribe(m.topic("/connection"), 0, nil); token.Wait() && token.Error() != nil {
+-		return token.Error()
+-	}
+-	if token := m.client.Subscribe(m.topic("/settings/#"), 0, nil); token.Wait() && token.Error() != nil {
+-		return token.Error()
+-	}
+ 
+ 	m.mqttData = map[string]string{}
+ 
+@@ -220,7 +244,7 @@ func (m *mqttClient) Run(cmd *cobra.Command, args []string) error {
+ 			}
+ 			// Publish as offline if last connection was >30s ago.
+ 			if time.Now().Sub(m.lastConnect) > 30*time.Second {
+-				m.client.Publish(m.topic("/available"), 0, true, "offline")
++				m.setAvailable("offline")
+ 			}
+ 			// Restart Wifi interface if > wifi_restart_time.
+ 			if wifiRestartTime > 0 && time.Now().Sub(m.lastConnect) > wifiRestartTime {
+@@ -236,7 +260,7 @@ func (m *mqttClient) Run(cmd *cobra.Command, args []string) error {
+ 
+ func (m *mqttClient) publish(topic, payload string) {
+ //	if cache := m.mqttData[topic]; cache != payload {
+-		m.client.Publish(m.topic(topic), 0, false, payload)
++		m.client.Publish(m.topic(topic), 0, true, payload)
+ 		m.mqttData[topic] = payload
+ //	}
+ }
+@@ -274,12 +298,12 @@ func (m *mqttClient) handleIncomingMqtt(mqtt_client mqtt.Client, msg mqtt.Messag
+ 		case "off":
+ 			m.enabled = false
+ 			m.phev.Close()
+-			m.client.Publish(m.topic("/available"), 0, true, "offline")
++			m.setAvailable("offline")
+ 		case "on":
+ 			m.enabled = true
+ 		case "restart":
+ 			m.enabled = true
+-			m.client.Publish(m.topic("/available"), 0, true, "offline")
++			m.setAvailable("offline")
+ 			m.phev.Close()
+ 		}
+ 	} else if msg.Topic() == m.topic("/set/parkinglights") {
+@@ -394,7 +418,7 @@ func (m *mqttClient) handlePhev(cmd *cobra.Command) error {
+ 	if err := m.phev.Start(); err != nil {
+ 		return err
+ 	}
+-	m.client.Publish(m.topic("/available"), 0, true, "online")
++	m.setAvailable("online")
+ 
+ 	m.lastError = nil
+ 

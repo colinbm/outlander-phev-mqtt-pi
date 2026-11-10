@@ -1,0 +1,411 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Outlander Bridge</title>
+<style>
+  :root {
+    --bg: #f4f4f1; --card: #ffffff; --text: #1d1d1b; --muted: #6b6b66; --line: #e3e2dc;
+    --ok: #1f8a4c; --warn: #b7791f; --bad: #c0392b; --off: #a3a39c;
+    --accent: #2f5fd0; --accent-text: #ffffff; --code: #f0efe9;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --bg: #161615; --card: #20201e; --text: #ecebe6; --muted: #9a9993; --line: #34332f;
+      --ok: #3fbf74; --warn: #e0a440; --bad: #e86a5b; --off: #64635d;
+      --accent: #6b93f0; --accent-text: #0f1420; --code: #2a2a27;
+    }
+  }
+  :root[data-theme="dark"] {
+    --bg: #161615; --card: #20201e; --text: #ecebe6; --muted: #9a9993; --line: #34332f;
+    --ok: #3fbf74; --warn: #e0a440; --bad: #e86a5b; --off: #64635d;
+    --accent: #6b93f0; --accent-text: #0f1420; --code: #2a2a27;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--text);
+         font: 15px/1.45 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; }
+  main { max-width: 760px; margin: 0 auto; padding: 16px 16px 48px; }
+  header { display: flex; align-items: baseline; justify-content: space-between; gap: 12px;
+           margin: 4px 0 16px; flex-wrap: wrap; }
+  h1 { font-size: 20px; margin: 0; }
+  h2 { font-size: 13px; text-transform: uppercase; letter-spacing: .06em; color: var(--muted);
+       margin: 0 0 10px; font-weight: 600; }
+  .sub { color: var(--muted); font-size: 13px; }
+  section { background: var(--card); border: 1px solid var(--line); border-radius: 12px;
+            padding: 14px 16px; margin-bottom: 14px; }
+  .rows { display: grid; gap: 8px; }
+  .row { display: flex; align-items: center; gap: 10px; min-width: 0; }
+  .row .label { flex: 0 0 auto; }
+  .row .detail { color: var(--muted); font-size: 13px; margin-left: auto; text-align: right;
+                 overflow-wrap: anywhere; }
+  .dot { width: 10px; height: 10px; border-radius: 50%; background: var(--off); flex: 0 0 10px; }
+  .dot.ok { background: var(--ok); } .dot.warn { background: var(--warn); } .dot.bad { background: var(--bad); }
+  .pill { display: inline-flex; align-items: center; gap: 6px; padding: 3px 10px; border-radius: 999px;
+          border: 1px solid var(--line); font-size: 13px; font-weight: 600; }
+  .tiles { display: grid; grid-template-columns: repeat(auto-fill, minmax(140px, 1fr)); gap: 8px; }
+  .tile { border: 1px solid var(--line); border-radius: 10px; padding: 8px 10px; }
+  .tile .k { color: var(--muted); font-size: 12px; }
+  .tile .v { font-size: 18px; font-weight: 600; font-variant-numeric: tabular-nums; }
+  button { font: inherit; font-size: 14px; border-radius: 8px; padding: 7px 14px; cursor: pointer;
+           border: 1px solid var(--line); background: var(--card); color: var(--text); }
+  button.primary { background: var(--accent); border-color: var(--accent); color: var(--accent-text); font-weight: 600; }
+  button:disabled { opacity: .5; cursor: default; }
+  .buttons { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 10px; }
+  input { font: inherit; padding: 7px 10px; border-radius: 8px; border: 1px solid var(--line);
+          background: var(--bg); color: var(--text); width: 100%; }
+  label.field { display: grid; gap: 4px; font-size: 13px; color: var(--muted); }
+  .form { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin-top: 12px; }
+  @media (max-width: 520px) { .form { grid-template-columns: 1fr; } }
+  ul.nets { list-style: none; margin: 10px 0 0; padding: 0; border: 1px solid var(--line); border-radius: 10px; }
+  ul.nets:empty { display: none; }
+  ul.nets li { display: flex; gap: 10px; align-items: center; padding: 8px 12px; cursor: pointer;
+               border-top: 1px solid var(--line); }
+  ul.nets li:first-child { border-top: 0; }
+  ul.nets li:hover, ul.nets li.sel { background: var(--code); }
+  ul.nets .ssid { font-weight: 600; overflow-wrap: anywhere; }
+  ul.nets .meta { margin-left: auto; color: var(--muted); font-size: 13px; white-space: nowrap; }
+  .bars { display: inline-flex; gap: 2px; align-items: flex-end; height: 12px; }
+  .bars i { width: 3px; background: var(--off); border-radius: 1px; }
+  .bars i.on { background: var(--text); }
+  pre { background: var(--code); border-radius: 8px; padding: 10px; font-size: 12px; overflow-x: auto;
+        white-space: pre-wrap; overflow-wrap: anywhere; margin: 10px 0 0; max-height: 320px; overflow-y: auto; }
+  pre:empty { display: none; }
+  details summary { cursor: pointer; color: var(--muted); font-size: 13px; margin-top: 10px; }
+  table { width: 100%; border-collapse: collapse; font-size: 13px; margin-top: 8px; }
+  td { padding: 4px 6px; border-top: 1px solid var(--line); vertical-align: top; overflow-wrap: anywhere; }
+  td.t { color: var(--muted); } td.age { color: var(--muted); text-align: right; white-space: nowrap; }
+  .note { color: var(--muted); font-size: 13px; margin: 6px 0 0; }
+  .job-ok { color: var(--ok); } .job-bad { color: var(--bad); }
+  .err { color: var(--bad); font-size: 13px; }
+</style>
+</head>
+<body>
+<main>
+  <header>
+    <div>
+      <h1>Outlander bridge</h1>
+      <div class="sub"><span id="host">PHEV bridge</span> · <span id="updated">loading…</span></div>
+    </div>
+    <span class="pill" id="overall"><span class="dot"></span><span>…</span></span>
+  </header>
+
+  <section>
+    <h2>Connections</h2>
+    <div class="rows">
+      <div class="row"><span class="dot" id="d-wifi"></span><span class="label">Car wifi</span><span class="detail" id="t-wifi"></span></div>
+      <div class="row"><span class="dot" id="d-car"></span><span class="label">Car reachable</span><span class="detail" id="t-car"></span></div>
+      <div class="row"><span class="dot" id="d-session"></span><span class="label">Bridge talking to car</span><span class="detail" id="t-session"></span></div>
+      <div class="row"><span class="dot" id="d-bridge"></span><span class="label">phev2mqtt → broker</span><span class="detail" id="t-bridge"></span></div>
+      <div class="row"><span class="dot" id="d-mqtt"></span><span class="label">This page → broker</span><span class="detail" id="t-mqtt"></span></div>
+    </div>
+  </section>
+
+  <section>
+    <h2>Latest from the car</h2>
+    <div class="tiles" id="tiles"></div>
+    <p class="note" id="data-note"></p>
+    <details>
+      <summary>All topics</summary>
+      <table><tbody id="topics"></tbody></table>
+    </details>
+  </section>
+
+  <section>
+    <h2>Car wifi</h2>
+    <div class="sub">Profile <b>car-remote</b> on <span id="car-iface">—</span> · network <b id="profile-ssid">—</b></div>
+    <div class="buttons">
+      <button data-action="reconnect">Reconnect</button>
+      <button data-action="reset-dongle">Reset dongle</button>
+      <button id="scan">Search for networks</button>
+    </div>
+    <span class="err" id="scan-err"></span>
+    <ul class="nets" id="nets"></ul>
+    <div class="form">
+      <label class="field">Network
+        <input id="ssid" autocomplete="off" spellcheck="false" placeholder="Pick from the list or type">
+      </label>
+      <label class="field">Password (blank keeps the saved one)
+        <input id="password" type="password" autocomplete="new-password">
+      </label>
+    </div>
+    <div class="buttons"><button class="primary" id="connect">Connect</button></div>
+    <p class="note">Changing the network repoints the car profile at a different hotspot. The Pi's
+      registered MAC address stays the same.</p>
+  </section>
+
+  <section>
+    <h2>Pairing</h2>
+    <p class="note" style="margin-top:0">Connect to the car's wifi first. In the car, start
+      <b>Setup Your Vehicle</b> (registration mode), then press Pair. The bridge stops while
+      pairing and restarts afterwards. The car allows a limited number of registrations.</p>
+    <div class="buttons">
+      <button class="primary" data-action="pair" id="pair">Pair with car</button>
+      <button data-action="restart-bridge">Restart phev2mqtt</button>
+    </div>
+  </section>
+
+  <section>
+    <h2>MQTT broker</h2>
+    <div class="form" style="margin-top:0">
+      <label class="field">Server (host or host:port)
+        <input id="m-server" autocomplete="off" spellcheck="false" placeholder="192.168.1.10:1883">
+      </label>
+      <label class="field">Topic prefix
+        <input id="m-prefix" autocomplete="off" spellcheck="false" placeholder="phev">
+      </label>
+      <label class="field">Username
+        <input id="m-user" autocomplete="off" spellcheck="false">
+      </label>
+      <label class="field"><span id="m-pass-label">Password</span>
+        <input id="m-pass" type="password" autocomplete="new-password">
+      </label>
+    </div>
+    <div class="buttons">
+      <button id="m-test">Test</button>
+      <button class="primary" id="m-save">Save &amp; restart phev2mqtt</button>
+      <button id="m-revert">Revert</button>
+    </div>
+    <p class="note" id="m-result"></p>
+    <p class="note">Saved to <code>/etc/phev2mqtt/env</code>, which phev2mqtt and the preheat script
+      read. Save only goes ahead if the login test passes. Changing the prefix also changes
+      the topics Homebridge needs to watch.</p>
+  </section>
+
+  <section id="job-section" hidden>
+    <h2>Last action</h2>
+    <div class="row"><span id="job-name"></span><span class="detail" id="job-state"></span></div>
+    <pre id="job-output"></pre>
+  </section>
+
+  <section>
+    <h2>Recent log</h2>
+    <pre id="logs"></pre>
+  </section>
+</main>
+
+<script>
+const $ = id => document.getElementById(id);
+let last = null, prefix = "phev", selected = null;
+
+function ago(t, now) {
+  if (!t) return "";
+  const s = Math.max(0, Math.round(now - t));
+  if (s < 60) return s + "s ago";
+  if (s < 3600) return Math.round(s / 60) + "m ago";
+  if (s < 86400) return Math.round(s / 3600) + "h ago";
+  return Math.round(s / 86400) + "d ago";
+}
+function setRow(name, state, text) {
+  $("d-" + name).className = "dot " + (state || "");
+  $("t-" + name).textContent = text || "";
+}
+async function api(path, body) {
+  const opt = body === undefined ? {} : { method: "POST", headers: { "Content-Type": "application/json" },
+                                          body: JSON.stringify(body) };
+  const r = await fetch("/api/" + path, opt);
+  const j = await r.json().catch(() => ({}));
+  if (!r.ok) throw new Error(j.error || r.statusText);
+  return j;
+}
+
+const TILES = [
+  ["battery/level", "Battery", v => v + "%"],
+  ["charge/charging", "Charging", v => v === "on" ? "Charging" : "Not charging"],
+  ["charge/plug", "Charger", v => v === "connected" ? "Live" : v === "unplugged" ? "Off / unplugged" : v],
+  ["charge/remaining", "Charge time left", v => v === "0" ? "—" : v + " min"],
+  ["door/locked", "Doors", v => v === "closed" ? "Locked" : v === "open" ? "Unlocked" : v],
+  ["climate/state", "Climate", v => v === "off" ? "Off" : v],
+  ["lights/head", "Headlights", v => v],
+  ["lights/parking", "Parking lights", v => v],
+];
+
+function renderData(s) {
+  const d = s.data, now = s.now;
+  const tiles = $("tiles"); tiles.replaceChildren();
+  for (const [t, k, fmt] of TILES) {
+    const e = d[prefix + "/" + t];
+    const el = document.createElement("div"); el.className = "tile";
+    const kk = document.createElement("div"); kk.className = "k"; kk.textContent = k;
+    const vv = document.createElement("div"); vv.className = "v"; vv.textContent = e ? fmt(e[0]) : "—";
+    el.append(kk, vv); tiles.append(el);
+  }
+  // Newest value that arrived live (not a retained copy from before this page server started).
+  let newest = 0;
+  for (const [t, e] of Object.entries(d))
+    if (!e[2] && t !== prefix + "/available") newest = Math.max(newest, e[1]);
+  const avail = (d[prefix + "/available"] || [])[0];
+  $("data-note").textContent = (newest ? "Last change from the car " + ago(newest, now) + ". " :
+    "No live changes since the page server started; values shown are the broker's last known state. ") +
+    (avail === "online" ? "" : "The car is offline, so these may be out of date.");
+  const rows = Object.entries(d).filter(([t]) => !t.includes("/register/") && !t.includes("/set/"))
+    .sort(([a], [b]) => a.localeCompare(b));
+  const tb = $("topics"); tb.replaceChildren();
+  for (const [t, e] of rows) {
+    const tr = document.createElement("tr");
+    const a = document.createElement("td"); a.className = "t"; a.textContent = t.replace(prefix + "/", "");
+    const b = document.createElement("td"); b.textContent = e[0];
+    const c = document.createElement("td"); c.className = "age"; c.textContent = e[2] ? "retained" : ago(e[1], now);
+    tr.append(a, b, c); tb.append(tr);
+  }
+}
+
+function render(s) {
+  last = s; prefix = s.mqtt.prefix || "phev";
+  const w = s.wifi, b = s.bridge, avail = (s.data[prefix + "/available"] || [])[0];
+  $("updated").textContent = "updated " + new Date(s.now * 1000).toLocaleTimeString();
+  $("profile-ssid").textContent = w.profile_ssid || "—";
+  $("car-iface").textContent = w.iface || "—";
+  if (s.host) $("host").textContent = s.host;
+
+  if (!w.present) setRow("wifi", "bad", "dongle not detected");
+  else if (w.connected) setRow("wifi", "ok", [w.ssid, w.signal, w.ip].filter(Boolean).join(" · "));
+  else setRow("wifi", w.state && w.state.startsWith("connecting") ? "warn" : "bad", w.state || "unknown");
+
+  if (!w.connected) setRow("car", "", "needs car wifi");
+  else if (s.car.reachable === null) setRow("car", "warn", "checking…");
+  else setRow("car", s.car.reachable ? "ok" : "bad",
+              (s.car.reachable ? "answers ping" : "not answering") + " · " + ago(s.car.checked, s.now));
+
+  if (b.service !== "active") setRow("session", "bad", "phev2mqtt is " + b.service);
+  else if (avail === "online" && b.car_socket) setRow("session", "ok", "online");
+  else if (b.car_socket) setRow("session", "warn", "connected, waiting for car");
+  else setRow("session", "bad", avail === "online" ? "no car connection" : "offline");
+
+  setRow("bridge", b.broker_socket ? "ok" : "bad",
+         (b.broker_socket ? "connected" : "not connected") + " · service " + b.service);
+  setRow("mqtt", s.mqtt.connected ? "ok" : "bad",
+         s.mqtt.connected ? s.mqtt.server + " · since " + ago(s.mqtt.since, s.now)
+                          : (s.mqtt.error || "connecting…"));
+
+  const good = w.connected && s.car.reachable && avail === "online" && b.broker_socket;
+  const ov = $("overall");
+  ov.children[0].className = "dot " + (good ? "ok" : w.connected ? "warn" : "bad");
+  ov.children[1].textContent = good ? "Car connected" : w.connected ? "Car wifi only" : "Car not connected";
+  $("pair").disabled = !w.connected;
+
+  renderData(s);
+  fillMqtt(s.settings, false);
+
+  const j = s.job;
+  if (j) {
+    $("job-section").hidden = false;
+    $("job-name").textContent = j.name;
+    const st = $("job-state");
+    st.className = "detail " + (j.done ? (j.ok ? "job-ok" : "job-bad") : "");
+    st.textContent = j.done ? (j.ok ? "done" : "failed") + " · " + ago(j.started, s.now) : "running…";
+    $("job-output").textContent = j.output;
+  }
+  document.querySelectorAll("[data-action]").forEach(el => {
+    if (el.id !== "pair" || w.connected) el.disabled = !!(j && !j.done);
+  });
+  $("connect").disabled = !!(j && !j.done);
+  $("m-save").disabled = !!(j && !j.done);
+
+  const lg = $("logs"), atBottom = lg.scrollTop + lg.clientHeight >= lg.scrollHeight - 4;
+  lg.textContent = s.logs.join("\n");
+  if (atBottom) lg.scrollTop = lg.scrollHeight;
+}
+
+async function refresh() {
+  try { render(await api("status")); }
+  catch (e) { $("updated").textContent = "can't reach the Pi (" + e.message + ")"; }
+}
+
+async function act(action, body) {
+  try { await api(action, body || {}); }
+  catch (e) { alert(e.message); }
+  refresh();
+}
+
+document.querySelectorAll("[data-action]").forEach(el =>
+  el.addEventListener("click", () => {
+    if (el.dataset.action === "pair" &&
+        !confirm("Is the car in Setup Your Vehicle (registration) mode? The bridge will stop while pairing."))
+      return;
+    act(el.dataset.action);
+  }));
+
+function bars(signal) {
+  const span = document.createElement("span"); span.className = "bars";
+  [25, 50, 70, 85].forEach((t, i) => {
+    const b = document.createElement("i"); b.style.height = (4 + i * 2.7) + "px";
+    if (signal >= t) b.className = "on"; span.append(b);
+  });
+  return span;
+}
+
+$("scan").addEventListener("click", async () => {
+  const btn = $("scan"); btn.disabled = true; btn.textContent = "Searching…"; $("scan-err").textContent = "";
+  try {
+    const { networks } = await api("scan", {});
+    const ul = $("nets"); ul.replaceChildren();
+    for (const n of networks) {
+      const li = document.createElement("li");
+      const name = document.createElement("span"); name.className = "ssid"; name.textContent = n.ssid;
+      const meta = document.createElement("span"); meta.className = "meta";
+      meta.textContent = (n.in_use ? "connected · " : "") + (n.security || "open") + " · " + n.signal + "% ";
+      meta.append(bars(n.signal));
+      li.append(name, meta);
+      li.addEventListener("click", () => {
+        ul.querySelectorAll("li").forEach(x => x.classList.remove("sel"));
+        li.classList.add("sel"); $("ssid").value = n.ssid; $("password").focus();
+      });
+      ul.append(li);
+    }
+    if (!networks.length) $("scan-err").textContent = "No networks found. Try Reset dongle.";
+  } catch (e) { $("scan-err").textContent = e.message; }
+  btn.disabled = false; btn.textContent = "Search for networks";
+});
+
+$("connect").addEventListener("click", () => {
+  const ssid = $("ssid").value.trim();
+  if (!ssid) { alert("Pick or type a network first."); return; }
+  if (last && last.wifi.profile_ssid && ssid !== last.wifi.profile_ssid &&
+      !confirm("Repoint the car profile from " + last.wifi.profile_ssid + " to " + ssid + "?")) return;
+  act("connect", { ssid, password: $("password").value });
+  $("password").value = "";
+});
+
+// MQTT settings form: filled from the Pi until the user edits it.
+let mqttDirty = false;
+const mqttFields = ["m-server", "m-prefix", "m-user", "m-pass"];
+mqttFields.forEach(id => $(id).addEventListener("input", () => { mqttDirty = true; }));
+function fillMqtt(st, force) {
+  if (!st || (mqttDirty && !force)) return;
+  $("m-server").value = st.server; $("m-prefix").value = st.prefix; $("m-user").value = st.username;
+  $("m-pass").value = "";
+  $("m-pass-label").textContent = st.has_password ? "Password (blank keeps the saved one)" : "Password";
+  mqttDirty = false;
+}
+function mqttForm() {
+  return { server: $("m-server").value, prefix: $("m-prefix").value,
+           username: $("m-user").value, password: $("m-pass").value };
+}
+function mqttResult(text, ok) {
+  const el = $("m-result"); el.textContent = text; el.className = "note " + (ok ? "job-ok" : "job-bad");
+}
+$("m-test").addEventListener("click", async () => {
+  mqttResult("Testing…", true);
+  try { await api("mqtt/test", mqttForm()); mqttResult("Login works.", true); }
+  catch (e) { mqttResult(e.message, false); }
+});
+$("m-save").addEventListener("click", async () => {
+  if (!confirm("Save these broker settings and restart phev2mqtt?")) return;
+  mqttResult("Testing and saving…", true);
+  try {
+    await api("mqtt/save", mqttForm());
+    mqttResult("Saved. phev2mqtt is restarting.", true);
+    mqttDirty = false; $("m-pass").value = "";
+  } catch (e) { mqttResult(e.message, false); }
+  refresh();
+});
+$("m-revert").addEventListener("click", () => {
+  fillMqtt(last && last.settings, true); $("m-result").textContent = "";
+});
+
+refresh();
+setInterval(refresh, 5000);
+</script>
+</body>
+</html>

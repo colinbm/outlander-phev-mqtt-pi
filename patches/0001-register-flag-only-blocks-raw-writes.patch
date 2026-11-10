@@ -1,0 +1,44 @@
+diff --git a/cmd/mqtt.go b/cmd/mqtt.go
+index cd6898f..d1538dd 100644
+--- a/cmd/mqtt.go
++++ b/cmd/mqtt.go
+@@ -149,6 +149,8 @@ type mqttClient struct {
+ 
+ 	climate *climate
+ 	enabled bool
++
++	disableRegisterSet bool
+ }
+ 
+ func (m *mqttClient) topic(topic string) string {
+@@ -190,13 +192,14 @@ func (m *mqttClient) Run(cmd *cobra.Command, args []string) error {
+ 		return token.Error()
+ 	}
+ 
+-	if !mqttDisableSet {
+-		if token := m.client.Subscribe(m.topic("/set/#"), 0, nil); token.Wait() && token.Error() != nil {
+-			return token.Error()
+-		}
+-	} else {
++	// Always subscribe to /set/#; the disable flag only blocks raw /set/register/ writes.
++	m.disableRegisterSet = mqttDisableSet
++	if mqttDisableSet {
+ 		log.Info("Setting vechicle registers via MQTT is disabled")
+ 	}
++	if token := m.client.Subscribe(m.topic("/set/#"), 0, nil); token.Wait() && token.Error() != nil {
++		return token.Error()
++	}
+ 	if token := m.client.Subscribe(m.topic("/connection"), 0, nil); token.Wait() && token.Error() != nil {
+ 		return token.Error()
+ 	}
+@@ -243,6 +246,10 @@ func (m *mqttClient) handleIncomingMqtt(mqtt_client mqtt.Client, msg mqtt.Messag
+ 
+ 	topicParts := strings.Split(msg.Topic(), "/")
+ 	if strings.HasPrefix(msg.Topic(), m.topic("/set/register/")) {
++		if m.disableRegisterSet {
++			log.Infof("Ignoring raw register write (disabled): %s", msg.Topic())
++			return
++		}
+ 		if len(topicParts) != 4 {
+ 			log.Infof("Bad topic format [%s]", msg.Topic())
+ 			return

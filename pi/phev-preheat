@@ -1,0 +1,148 @@
+#!/usr/bin/env python3
+"""Start a preheat via phev2mqtt and confirm the car reports it.
+
+Usage: phev-preheat [--dry-run] [MINUTES]   (10, 20 or 30; default 30)
+       --dry-run checks broker and car availability without sending anything.
+
+Keeps retrying for up to 20 minutes while the car is unreachable (its hotspot
+sleeps when parked). Exits 0 once the car reports climate/state = heat, 1 if it
+never does. Reads broker settings from /etc/phev2mqtt/env, so run it as root.
+"""
+import socket, struct, sys, syslog, time
+
+ARGS = [a for a in sys.argv[1:] if a != "--dry-run"]
+DRY_RUN = "--dry-run" in sys.argv[1:]
+MINUTES = ARGS[0] if ARGS else "30"
+if MINUTES not in ("10", "20", "30"):
+    sys.exit("MINUTES must be 10, 20 or 30")
+DEADLINE = time.time() + 20 * 60
+RETRY_SECS = 30
+CONFIRM_SECS = 60
+MAX_SENDS = 3
+
+def log(msg):
+    print(msg, flush=True)
+    syslog.syslog(msg)
+
+def load_env(path="/etc/phev2mqtt/env"):
+    env = {}
+    for line in open(path):
+        if "=" in line and not line.startswith("#"):
+            k, v = line.strip().split("=", 1)
+            env[k] = v
+    return env
+
+# --- minimal MQTT 3.1.1 client (QoS 0) ---------------------------------------
+def _s(b): return struct.pack("!H", len(b)) + b
+
+def _pkt(t, body):
+    n, rl = len(body), b""
+    while True:
+        d, n = n % 128, n // 128
+        rl += bytes([d | (0x80 if n else 0)])
+        if not n:
+            return bytes([t]) + rl + body
+
+class Mqtt:
+    def __init__(self, host, port, user, pw):
+        self.sock = socket.create_connection((host, port), 10)
+        self.buf = b""
+        cid = b"phev-preheat-%d" % time.time()
+        self.sock.sendall(_pkt(0x10, _s(b"MQTT") + bytes([4, 0xC2]) + struct.pack("!H", 60)
+                               + _s(cid) + _s(user.encode()) + _s(pw.encode())))
+        t, body = self._read(10)
+        if t != 2 or body[1] != 0:
+            raise RuntimeError("MQTT connect refused")
+
+    def subscribe(self, *topics):
+        body = struct.pack("!H", 1) + b"".join(_s(t.encode()) + b"\x00" for t in topics)
+        self.sock.sendall(_pkt(0x82, body))
+
+    def publish(self, topic, payload):
+        self.sock.sendall(_pkt(0x30, _s(topic.encode()) + payload.encode()))
+
+    def _read(self, timeout):
+        end = time.time() + timeout
+        while True:
+            if len(self.buf) >= 2:
+                mul, rl, i = 1, 0, 1
+                while i < len(self.buf):
+                    b = self.buf[i]; rl += (b & 127) * mul; mul *= 128; i += 1
+                    if not b & 128:
+                        break
+                if len(self.buf) >= i + rl:
+                    t, body = self.buf[0], self.buf[i:i + rl]
+                    self.buf = self.buf[i + rl:]
+                    return t >> 4, body if t >> 4 != 3 else (t, body)
+            left = end - time.time()
+            if left <= 0:
+                return None, None
+            self.sock.settimeout(left)
+            try:
+                d = self.sock.recv(4096)
+            except socket.timeout:
+                return None, None
+            if not d:
+                raise RuntimeError("MQTT connection closed")
+            self.buf += d
+
+    def messages(self, seconds):
+        """Yield (topic, payload) for `seconds`."""
+        end = time.time() + seconds
+        while time.time() < end:
+            t, body = self._read(end - time.time())
+            if t == 3:
+                hdr, body = body
+                tl = struct.unpack("!H", body[:2])[0]
+                off = 2 + tl + (2 if (hdr >> 1) & 3 else 0)
+                yield body[2:2 + tl].decode(), body[off:].decode(errors="replace")
+
+    def close(self):
+        try:
+            self.sock.sendall(b"\xe0\x00"); self.sock.close()
+        except OSError:
+            pass
+
+def main():
+    env = load_env()
+    server = env.get("MQTT_SERVER", "tcp://127.0.0.1:1883").split("://")[-1]
+    host, _, port = server.partition(":")
+    prefix = env.get("MQTT_TOPIC_PREFIX", "phev")
+    sends = 0
+    log(f"preheat {MINUTES} min requested")
+    while time.time() < DEADLINE:
+        try:
+            m = Mqtt(host, int(port or 1883), env["MQTT_USERNAME"], env["MQTT_PASSWORD"])
+            m.subscribe(f"{prefix}/available", f"{prefix}/climate/state")
+            state = {}
+            for topic, payload in m.messages(3):
+                state[topic] = payload
+            avail = state.get(f"{prefix}/available")
+            climate = state.get(f"{prefix}/climate/state")
+            if DRY_RUN:
+                log(f"dry run: available={avail} climate/state={climate}; would send heat={MINUTES}")
+                m.close(); return 0
+            if avail != "online":
+                log(f"car not reachable (available={avail}); retrying in {RETRY_SECS}s")
+            elif climate == "heat" and sends:
+                log("car already reports heat"); m.close(); return 0
+            elif sends >= MAX_SENDS:
+                log(f"sent {sends} times without confirmation; giving up"); m.close(); return 1
+            else:
+                m.publish(f"{prefix}/set/climate/heat", MINUTES)
+                sends += 1
+                log(f"sent heat={MINUTES} (attempt {sends}); waiting for confirmation")
+                for topic, payload in m.messages(CONFIRM_SECS):
+                    if topic == f"{prefix}/climate/state" and payload == "heat":
+                        log("car confirmed: climate/state = heat"); m.close(); return 0
+                log("no confirmation yet")
+            m.close()
+        except (OSError, RuntimeError) as e:
+            log(f"MQTT error: {e}")
+        time.sleep(RETRY_SECS)
+    log("gave up: car never confirmed preheat before the deadline")
+    return 1
+
+if __name__ == "__main__":
+    syslog.openlog("phev-preheat")
+    sys.exit(main())

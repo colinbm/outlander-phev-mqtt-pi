@@ -1,0 +1,91 @@
+#!/bin/bash
+# Reload the car dongle's driver when it is wedged.
+#
+# The drivers have been seen to wedge in three ways:
+#  1. Not connected, and a scan sees no networks at all. The home networks are always
+#     in range, so an empty scan means the driver has stopped receiving.
+#  2. Not connected, and a scan sees the car's hotspot, but authentication keeps timing
+#     out (receive works, transmit doesn't). Each check first tries `nmcli con up`
+#     (see below); reload once that has failed on two checks in a row.
+#  3. Connected, but the car doesn't answer ping (mt7601u, 2026-10-27): beacons still
+#     arrive, data frames from the car don't. A reload fixes it within seconds.
+# Installed at /usr/local/sbin/wlan1-watchdog, run by wlan1-watchdog.timer. (The name
+# predates install.sh; the car adapter needn't be wlan1.)
+set -u
+# install.sh writes CAR_MAC (the car adapter's own MAC), CAR_PROFILE and CAR_IP here.
+CAR_MAC= CAR_PROFILE=car-remote CAR_IP=192.168.8.46 CAR_IFACE=
+[[ -r /etc/phev-bridge.conf ]] && . /etc/phev-bridge.conf
+if [[ -z "$CAR_IFACE" && -n "$CAR_MAC" ]]; then
+    # Interface names can change between boots, so find the adapter by MAC. While
+    # NetworkManager clones another MAC onto it, ip shows the real one as "permaddr".
+    CAR_IFACE=$(ip -o link | awk -v m="${CAR_MAC,,}" \
+        'index(tolower($0), "link/ether " m) || index(tolower($0), "permaddr " m) {sub(/:$/, "", $2); print $2; exit}')
+fi
+IFACE=${CAR_IFACE:-wlan1}
+log() { logger -t wlan1-watchdog "$*"; }
+
+# phev-web creates this while pairing; the car may stop answering then.
+[[ -e /run/wlan1-watchdog.pause ]] && exit 0
+
+if [[ ! -e /sys/class/net/$IFACE ]]; then
+    log "car wifi adapter ${CAR_MAC:-$IFACE} not found; is it plugged in? (re-run install.sh after swapping it)"
+    exit 0
+fi
+# Whichever driver the dongle uses (rtl8xxxu for the TP-Link, mt7601u for the MediaTek).
+MODULE=$(basename "$(readlink -f /sys/class/net/$IFACE/device/driver/module 2>/dev/null)" 2>/dev/null)
+[[ -n "$MODULE" && "$MODULE" != "." ]] || MODULE=rtl8xxxu
+CAR_SSID=$(nmcli -g 802-11-wireless.ssid connection show "$CAR_PROFILE" 2>/dev/null || true)
+SEEN_FILE=/run/wlan1-watchdog.car-seen-unconnected
+
+# GENERAL.STATE is e.g. "100 (connected)"; anything else means not on the car.
+state=$(nmcli -g GENERAL.STATE device show "$IFACE" 2>/dev/null || true)
+if [[ "$state" == 100* ]]; then
+    rm -f "$SEEN_FILE"
+    if ping -q -c 5 -W 2 -I "$IFACE" "$CAR_IP" >/dev/null 2>&1; then
+        exit 0
+    fi
+    log "$IFACE connected but $CAR_IP not answering ping; reloading $MODULE"
+    modprobe -r "$MODULE" && sleep 2 && modprobe "$MODULE"
+    log "reloaded $MODULE (exit $?)"
+    exit 0
+fi
+
+scan() {
+    timeout 40 nmcli -t -f SSID device wifi list ifname "$IFACE" --rescan yes 2>/dev/null
+}
+
+if [[ -n "$state" ]]; then
+    ssids=$(scan)
+    if [[ -z "$ssids" ]]; then
+        # Scans can be refused right after a previous one; give it one more go.
+        sleep 15
+        ssids=$(scan)
+    fi
+    if [[ -z "$ssids" ]]; then
+        log "$IFACE not connected (${state}) and scan sees no networks; reloading $MODULE"
+    elif [[ -n "$CAR_SSID" ]] && grep -qxF "$CAR_SSID" <<<"$ssids"; then
+        # A join the car cuts off mid-handshake fails as 'no-secrets', and NetworkManager
+        # then stops autoconnecting the profile until it is brought up by hand.
+        if timeout 60 nmcli con up "$CAR_PROFILE" >/dev/null 2>&1; then
+            log "$IFACE saw $CAR_SSID unconnected (${state}); nmcli con up $CAR_PROFILE worked"
+            rm -f "$SEEN_FILE"
+            exit 0
+        fi
+        if [[ -e "$SEEN_FILE" ]]; then
+            log "$IFACE sees $CAR_SSID but still not connected (${state}) since $(cat "$SEEN_FILE"); reloading $MODULE"
+            rm -f "$SEEN_FILE"
+        else
+            date +%T > "$SEEN_FILE"
+            exit 0
+        fi
+    else
+        # Car just away; driver is receiving fine.
+        rm -f "$SEEN_FILE"
+        exit 0
+    fi
+else
+    log "$IFACE missing from NetworkManager; reloading $MODULE"
+fi
+
+modprobe -r "$MODULE" && sleep 2 && modprobe "$MODULE"
+log "reloaded $MODULE (exit $?)"

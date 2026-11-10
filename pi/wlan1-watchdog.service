@@ -1,0 +1,7 @@
+[Unit]
+Description=Reload the car wifi dongle driver if it has wedged
+After=NetworkManager.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/wlan1-watchdog

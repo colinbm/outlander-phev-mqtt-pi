@@ -1,0 +1,532 @@
+#!/usr/bin/env python3
+"""Small web page for the car bridge: status, car wifi, pairing, latest data.
+
+Serves http://<pi>/ (port 80, or PHEV_WEB_PORT). Runs as root because it drives
+nmcli, modprobe and systemctl. Reads broker settings from /etc/phev2mqtt/env.
+Installed at /usr/local/sbin/phev-web, run by phev-web.service.
+"""
+import json, os, socket, struct, subprocess, sys, syslog, threading, time
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+def load_conf(path="/etc/phev-bridge.conf"):
+    """install.sh writes CAR_MAC (the car adapter's own MAC), CAR_PROFILE and CAR_IP here."""
+    conf = {"CAR_MAC": "", "CAR_PROFILE": "car-remote", "CAR_IP": "192.168.8.46", "CAR_IFACE": ""}
+    try:
+        for line in open(path):
+            k, sep, v = line.strip().partition("=")
+            if sep and not k.startswith("#"):
+                conf[k.strip()] = v.strip().strip("'\"")
+    except OSError:
+        pass
+    return conf
+
+CONF = load_conf()
+PROFILE = CONF["CAR_PROFILE"]
+CAR_IP = CONF["CAR_IP"]
+
+def car_iface():
+    """The car adapter's interface name, found by MAC because names can change between boots.
+    While NetworkManager clones another MAC onto it, `ip` shows the real one as permaddr."""
+    if CONF["CAR_IFACE"] or not CONF["CAR_MAC"]:
+        return CONF["CAR_IFACE"] or "wlan1"
+    mac = CONF["CAR_MAC"].lower()
+    code, text = run(["ip", "-o", "link"], 10)
+    for line in text.splitlines():
+        low = line.lower()
+        if "link/ether " + mac in low or "permaddr " + mac in low:
+            return line.split(":")[1].strip()
+    return "wlan1"
+
+PHEV2MQTT = "/usr/local/bin/phev2mqtt"
+PAUSE_FILE = "/run/wlan1-watchdog.pause"
+PORT = int(os.environ.get("PHEV_WEB_PORT", "80"))
+HTML_PATHS = [os.path.join(os.path.dirname(os.path.abspath(__file__)), "phev-web.html"),
+              "/usr/local/share/phev-web/phev-web.html"]
+
+def log(msg):
+    syslog.syslog(msg)
+
+ENV_FILE = "/etc/phev2mqtt/env"
+
+def load_env(path=ENV_FILE):
+    env = {}
+    for line in open(path):
+        if "=" in line and not line.startswith("#"):
+            k, v = line.strip().split("=", 1)
+            env[k] = v
+    return env
+
+def save_env(updates, path=ENV_FILE):
+    """Rewrite the env file with `updates` applied, keeping other lines and order."""
+    lines, done = [], set()
+    for line in open(path):
+        k = line.split("=", 1)[0].strip()
+        if "=" in line and not line.startswith("#") and k in updates:
+            lines.append("%s=%s\n" % (k, updates[k])); done.add(k)
+        else:
+            lines.append(line if line.endswith("\n") else line + "\n")
+    lines += ["%s=%s\n" % (k, v) for k, v in updates.items() if k not in done]
+    tmp = path + ".new"
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as f:
+        f.writelines(lines)
+    os.replace(tmp, path)
+
+def broker_addr(server):
+    """'tcp://host:port' or 'host[:port]' -> (host, port)."""
+    host, _, port = server.split("://")[-1].partition(":")
+    return host, int(port or 1883)
+
+def run(cmd, timeout=30):
+    """Run a command; return (exit code, combined output)."""
+    try:
+        p = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+        return p.returncode, (p.stdout + p.stderr).strip()
+    except subprocess.TimeoutExpired:
+        return 124, "timed out after %ds" % timeout
+    except OSError as e:
+        return 127, str(e)
+
+def nm_split(line):
+    """Split an `nmcli -t` line on unescaped colons."""
+    out, cur, esc = [], "", False
+    for ch in line:
+        if esc:
+            cur += ch; esc = False
+        elif ch == "\\":
+            esc = True
+        elif ch == ":":
+            out.append(cur); cur = ""
+        else:
+            cur += ch
+    out.append(cur)
+    return out
+
+# --- minimal MQTT 3.1.1 subscriber (QoS 0), same approach as phev-preheat -----
+def _s(b): return struct.pack("!H", len(b)) + b
+
+def _pkt(t, body):
+    n, rl = len(body), b""
+    while True:
+        d, n = n % 128, n // 128
+        rl += bytes([d | (0x80 if n else 0)])
+        if not n:
+            return bytes([t]) + rl + body
+
+def connect_packet(cid, user, pw, keepalive=60):
+    flags = 0x02 | (0x80 if user else 0) | (0x40 if pw else 0)
+    body = _s(b"MQTT") + bytes([4, flags]) + struct.pack("!H", keepalive) + _s(cid)
+    if user: body += _s(user.encode())
+    if pw: body += _s(pw.encode())
+    return _pkt(0x10, body)
+
+CONNACK_ERRORS = {1: "unsupported protocol version", 2: "client id rejected",
+                  3: "server unavailable", 4: "bad username or password", 5: "not authorised"}
+
+def mqtt_try(addr, user, pw):
+    """Try logging in to a broker; return None if it works, else an error message."""
+    try:
+        with socket.create_connection(addr, 8) as sock:
+            sock.settimeout(8)
+            sock.sendall(connect_packet(b"phev-web-test-%d" % os.getpid(), user, pw, 10))
+            resp = sock.recv(4)
+            if len(resp) < 4 or resp[0] >> 4 != 2:
+                return "no MQTT reply from %s:%d" % addr
+            if resp[3]:
+                return "broker refused: " + CONNACK_ERRORS.get(resp[3], "code %d" % resp[3])
+            sock.sendall(b"\xe0\x00")
+    except OSError as e:
+        return "can't reach %s:%d (%s)" % (addr[0], addr[1], e.strerror or e)
+    return None
+
+class Feed(threading.Thread):
+    """Keeps a subscription to <prefix>/# and remembers the latest value of each topic."""
+    def __init__(self, env):
+        super().__init__(daemon=True)
+        self.values = {}          # topic -> [payload, time received, was retained]
+        self.connected = False
+        self.since = None
+        self.error = None
+        self.lock = threading.Lock()
+        self.configure(env)
+
+    def configure(self, env):
+        """Point at (possibly new) broker settings; the current session drops and reconnects."""
+        self.addr = broker_addr(env.get("MQTT_SERVER", "tcp://127.0.0.1:1883"))
+        self.user, self.pw = env.get("MQTT_USERNAME", ""), env.get("MQTT_PASSWORD", "")
+        prefix = env.get("MQTT_TOPIC_PREFIX", "phev")
+        if prefix != getattr(self, "prefix", prefix):
+            with self.lock:
+                self.values = {}
+        self.prefix = prefix
+        self.reset = True
+
+    def run(self):
+        while True:
+            try:
+                self.session()
+            except Exception as e:
+                self.error = str(e) or type(e).__name__
+            if self.connected:
+                log("MQTT disconnected: %s" % self.error)
+            self.connected = False
+            for _ in range(10):
+                if self.reset:
+                    break
+                time.sleep(1)
+
+    def session(self):
+        self.reset = False
+        sock = socket.create_connection(self.addr, 10)
+        try:
+            sock.sendall(connect_packet(b"phev-web-%d" % os.getpid(), self.user, self.pw))
+            sock.sendall(_pkt(0x82, struct.pack("!H", 1) + _s((self.prefix + "/#").encode()) + b"\x00"))
+            sock.settimeout(1)
+            buf, last_ping, last_rx = b"", time.time(), time.time()
+            while True:
+                if self.reset:
+                    raise RuntimeError("settings changed")
+                now = time.time()
+                if now - last_ping > 30:
+                    sock.sendall(b"\xc0\x00"); last_ping = now
+                if now - last_rx > 90:
+                    raise RuntimeError("broker stopped answering")
+                try:
+                    d = sock.recv(8192)
+                except socket.timeout:
+                    continue
+                if not d:
+                    raise RuntimeError("broker closed the connection")
+                buf += d; last_rx = time.time()
+                while len(buf) >= 2:
+                    mul, rl, i = 1, 0, 1
+                    while i < len(buf):
+                        b = buf[i]; rl += (b & 127) * mul; mul *= 128; i += 1
+                        if not b & 128:
+                            break
+                    else:
+                        break
+                    if len(buf) < i + rl:
+                        break
+                    hdr, pkt, buf = buf[0], buf[i:i + rl], buf[i + rl:]
+                    self.handle(hdr, pkt)
+        finally:
+            sock.close()
+
+    def handle(self, hdr, pkt):
+        kind = hdr >> 4
+        if kind == 2:                       # CONNACK
+            if pkt[1] != 0:
+                raise RuntimeError("broker refused: " + CONNACK_ERRORS.get(pkt[1], "code %d" % pkt[1]))
+            self.connected, self.since, self.error = True, time.time(), None
+            log("MQTT connected to %s:%d" % self.addr)
+        elif kind == 3:                     # PUBLISH
+            tl = struct.unpack("!H", pkt[:2])[0]
+            off = 2 + tl + (2 if (hdr >> 1) & 3 else 0)
+            topic = pkt[2:2 + tl].decode(errors="replace")
+            with self.lock:
+                self.values[topic] = [pkt[off:].decode(errors="replace"), time.time(), bool(hdr & 1)]
+
+    def snapshot(self):
+        with self.lock:
+            return {t: list(v) for t, v in self.values.items()}
+
+# --- car reachability, checked in the background ----------------------------
+class CarPing(threading.Thread):
+    def __init__(self):
+        super().__init__(daemon=True)
+        self.ok, self.checked = None, None
+    def run(self):
+        while True:
+            code, _ = run(["ping", "-q", "-c", "1", "-W", "2", "-I", car_iface(), CAR_IP], 10)
+            self.ok, self.checked = code == 0, time.time()
+            time.sleep(10)
+
+# --- actions run one at a time in the background -----------------------------
+class Jobs:
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.job = None
+
+    def start(self, name, fn, *args):
+        with self.lock:
+            if self.job and not self.job["done"]:
+                return False
+            self.job = {"name": name, "started": time.time(), "done": False, "ok": None, "output": ""}
+        threading.Thread(target=self._run, args=(fn, args), daemon=True).start()
+        return True
+
+    def out(self, text):
+        self.job["output"] += text.rstrip("\n") + "\n"
+
+    def step(self, label, cmd, timeout=60):
+        self.out("$ " + label)
+        code, text = run(cmd, timeout)
+        if text:
+            self.out(text)
+        if code:
+            self.out("(exit %d)" % code)
+        return code == 0
+
+    def _run(self, fn, args):
+        log("action: %s" % self.job["name"])
+        try:
+            ok = fn(self, *args)
+        except Exception as e:
+            self.out("error: %s" % e); ok = False
+        self.job["ok"], self.job["done"] = bool(ok), True
+        log("action %s %s" % (self.job["name"], "succeeded" if ok else "failed"))
+
+def job_reconnect(j):
+    return j.step("nmcli connection up " + PROFILE, ["nmcli", "connection", "up", PROFILE], 60)
+
+def job_connect(j, ssid, password):
+    # install.sh leaves autoconnect off until a car network has been chosen.
+    cmd = ["nmcli", "connection", "modify", PROFILE, "802-11-wireless.ssid", ssid,
+           "connection.autoconnect", "yes"]
+    if password:
+        cmd += ["wifi-sec.key-mgmt", "wpa-psk", "wifi-sec.psk", password]
+    j.out("$ nmcli connection modify %s ssid %r%s" % (PROFILE, ssid, " + new password" if password else ""))
+    code, text = run(cmd)
+    if text:
+        j.out(text)
+    if code:
+        j.out("(exit %d)" % code); return False
+    return job_reconnect(j)
+
+def dongle_module():
+    path = os.path.realpath("/sys/class/net/%s/device/driver/module" % car_iface())
+    name = os.path.basename(path)
+    return name if name not in ("", "module", ".") else "mt7601u"
+
+def job_reset_dongle(j):
+    mod = dongle_module()
+    ok = j.step("modprobe -r " + mod, ["modprobe", "-r", mod]) and \
+        (time.sleep(2) or True) and j.step("modprobe " + mod, ["modprobe", mod])
+    if ok:
+        j.out("Driver reloaded; waiting for NetworkManager to bring the dongle back…")
+        for _ in range(20):
+            time.sleep(1)
+            if os.path.exists("/sys/class/net/" + car_iface()):
+                break
+        time.sleep(3)
+        ok = job_reconnect(j)
+    return ok
+
+def job_restart_bridge(j):
+    return j.step("systemctl restart phev2mqtt", ["systemctl", "restart", "phev2mqtt"])
+
+def job_pair(j):
+    state = wifi_status()
+    if not state["connected"]:
+        j.out("The Pi isn't connected to the car's wifi. Connect first, then pair.")
+        return False
+    j.step("systemctl stop phev2mqtt", ["systemctl", "stop", "phev2mqtt"])
+    j.out("$ phev2mqtt client register   (up to 2 minutes)")
+    ok = False
+    open(PAUSE_FILE, "w").close()   # keeps wlan1-watchdog from reloading the driver mid-pairing
+    try:
+        env = dict(os.environ, HOME="/root")
+        p = subprocess.Popen([PHEV2MQTT, "client", "register"], stdout=subprocess.PIPE,
+                             stderr=subprocess.STDOUT, text=True, env=env)
+        killer = threading.Timer(120, p.kill); killer.start()
+        for line in p.stdout:
+            j.out(line)
+        p.wait(); killer.cancel()
+        ok = p.returncode == 0
+        if p.returncode:
+            j.out("(exit %d)" % p.returncode)
+    finally:
+        os.remove(PAUSE_FILE)
+        j.step("systemctl start phev2mqtt", ["systemctl", "start", "phev2mqtt"])
+    return ok
+
+# --- status ------------------------------------------------------------------
+def wifi_status():
+    iface = car_iface()
+    st = {"connected": False, "state": None, "ssid": None, "ip": None, "signal": None,
+          "profile_ssid": None, "iface": iface, "present": os.path.exists("/sys/class/net/" + iface)}
+    code, text = run(["nmcli", "-t", "-f", "GENERAL.STATE,GENERAL.CONNECTION,IP4.ADDRESS",
+                      "device", "show", iface], 10)
+    for line in text.splitlines() if code == 0 else []:
+        k, _, v = line.partition(":")
+        if k == "GENERAL.STATE":
+            st["state"] = v.split(" ", 1)[-1].strip("()") or v
+            st["connected"] = v.startswith("100")
+        elif k.startswith("IP4.ADDRESS"):
+            st["ip"] = v
+    code, text = run(["iw", "dev", iface, "link"], 10)
+    for line in text.splitlines():
+        line = line.strip()
+        if line.startswith("SSID:"):
+            st["ssid"] = line[5:].strip()
+        elif line.startswith("signal:"):
+            st["signal"] = line[7:].strip()
+    code, text = run(["nmcli", "-g", "802-11-wireless.ssid", "connection", "show", PROFILE], 10)
+    if code == 0:
+        st["profile_ssid"] = text
+    return st
+
+def bridge_status():
+    code, active = run(["systemctl", "is-active", "phev2mqtt"], 10)
+    code, since = run(["systemctl", "show", "-p", "ActiveEnterTimestamp", "--value", "phev2mqtt"], 10)
+    code, socks = run(["ss", "-tnpH", "state", "established"], 10)
+    broker = any("phev2mqtt" in l and ":1883" in l for l in socks.splitlines())
+    car = any("phev2mqtt" in l and CAR_IP + ":8080" in l for l in socks.splitlines())
+    return {"service": active, "since": since, "broker_socket": broker, "car_socket": car}
+
+def recent_logs(n=30):
+    code, text = run(["journalctl", "-n", str(n), "--no-pager", "-o", "short",
+                      "_SYSTEMD_UNIT=phev2mqtt.service", "+", "SYSLOG_IDENTIFIER=wlan1-watchdog",
+                      "+", "SYSLOG_IDENTIFIER=phev-web"], 15)
+    return text.splitlines()
+
+def scan():
+    cmd = ["nmcli", "-t", "-f", "IN-USE,BSSID,SSID,SIGNAL,SECURITY,CHAN", "device", "wifi",
+           "list", "ifname", car_iface(), "--rescan", "yes"]
+    code, text = run(cmd, 45)
+    if code:
+        code, text = run(cmd[:-2], 20)   # a scan may be refused right after another
+    if code:
+        raise RuntimeError(text or "scan failed")
+    nets = {}
+    for line in text.splitlines():
+        f = nm_split(line)
+        if len(f) < 6 or not f[2]:
+            continue
+        n = {"in_use": f[0] == "*", "bssid": f[1], "ssid": f[2],
+             "signal": int(f[3] or 0), "security": f[4], "channel": f[5]}
+        if f[2] not in nets or n["signal"] > nets[f[2]]["signal"]:
+            nets[f[2]] = n
+    return sorted(nets.values(), key=lambda n: -n["signal"])
+
+# --- MQTT settings -------------------------------------------------------------
+def mqtt_settings():
+    env = load_env()
+    return {"server": env.get("MQTT_SERVER", "").split("://")[-1],
+            "username": env.get("MQTT_USERNAME", ""),
+            "has_password": bool(env.get("MQTT_PASSWORD")),
+            "prefix": env.get("MQTT_TOPIC_PREFIX", "phev")}
+
+def parse_mqtt_settings(body):
+    """Validate a settings form; return (env updates, error). Blank password keeps the saved one."""
+    server = str(body.get("server", "")).strip()
+    user = str(body.get("username", "")).strip()
+    pw = str(body.get("password", ""))
+    prefix = str(body.get("prefix", "")).strip().strip("/") or "phev"
+    if "://" in server:
+        scheme, server = server.split("://", 1)
+        if scheme not in ("tcp", "mqtt"):
+            return None, "only plain MQTT (tcp://) is supported here"
+    host, _, port = server.partition(":")
+    if not host or any(c.isspace() for c in server) or (port and not port.isdigit()):
+        return None, "server should look like 192.168.1.10 or 192.168.1.10:1883"
+    if any(c in s for s in (user, pw) for c in "\r\n"):
+        return None, "username and password can't contain line breaks"
+    if any(c in prefix for c in "#+ \r\n"):
+        return None, "topic prefix can't contain spaces, # or +"
+    env = load_env()
+    return {"MQTT_SERVER": "tcp://%s:%s" % (host, port or "1883"),
+            "MQTT_USERNAME": user,
+            "MQTT_PASSWORD": pw or env.get("MQTT_PASSWORD", ""),
+            "MQTT_TOPIC_PREFIX": prefix}, None
+
+def job_apply_mqtt(j, updates):
+    shown = {k: ("(saved)" if k == "MQTT_PASSWORD" else v) for k, v in updates.items()}
+    j.out("Saved to %s:\n%s" % (ENV_FILE, "\n".join("  %s=%s" % kv for kv in shown.items())))
+    FEED.configure(load_env())
+    return j.step("systemctl restart phev2mqtt", ["systemctl", "restart", "phev2mqtt"])
+
+# --- HTTP --------------------------------------------------------------------
+ACTIONS = {"reconnect": ("Reconnect to car wifi", job_reconnect),
+           "reset-dongle": ("Reset the wifi dongle", job_reset_dongle),
+           "restart-bridge": ("Restart phev2mqtt", job_restart_bridge),
+           "pair": ("Pair with the car", job_pair)}
+
+class Handler(BaseHTTPRequestHandler):
+    server_version = "phev-web"
+
+    def log_message(self, fmt, *args):
+        pass
+
+    def send(self, code, body, ctype="application/json"):
+        data = body if isinstance(body, bytes) else json.dumps(body).encode()
+        self.send_response(code)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(len(data)))
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        self.wfile.write(data)
+
+    def do_GET(self):
+        if self.path in ("/", "/index.html"):
+            with open(next(p for p in HTML_PATHS if os.path.exists(p)), "rb") as f:
+                self.send(200, f.read(), "text/html; charset=utf-8")
+        elif self.path == "/api/status":
+            self.send(200, {
+                "now": time.time(),
+                "host": socket.gethostname(),
+                "wifi": wifi_status(),
+                "car": {"reachable": PING.ok, "checked": PING.checked},
+                "bridge": bridge_status(),
+                "mqtt": {"connected": FEED.connected, "since": FEED.since, "error": FEED.error,
+                         "server": "%s:%d" % FEED.addr, "prefix": FEED.prefix},
+                "settings": mqtt_settings(),
+                "data": FEED.snapshot(),
+                "job": JOBS.job,
+                "logs": recent_logs(),
+            })
+        else:
+            self.send(404, {"error": "not found"})
+
+    def do_POST(self):
+        # Requiring a JSON content type stops other web pages posting here from a browser.
+        if not self.headers.get("Content-Type", "").startswith("application/json"):
+            return self.send(415, {"error": "send application/json"})
+        try:
+            body = json.loads(self.rfile.read(int(self.headers.get("Content-Length") or 0)) or b"{}")
+        except ValueError:
+            return self.send(400, {"error": "bad JSON"})
+        path = self.path.removeprefix("/api/")
+        if path == "scan":
+            try:
+                return self.send(200, {"networks": scan()})
+            except RuntimeError as e:
+                return self.send(500, {"error": str(e)})
+        if path in ("mqtt/test", "mqtt/save"):
+            updates, err = parse_mqtt_settings(body)
+            if not err:
+                err = mqtt_try(broker_addr(updates["MQTT_SERVER"]),
+                               updates["MQTT_USERNAME"], updates["MQTT_PASSWORD"])
+            if err:
+                return self.send(400, {"error": err})
+            if path == "mqtt/test":
+                return self.send(200, {"ok": True})
+            if JOBS.job and not JOBS.job["done"]:
+                return self.send(409, {"error": "another action is still running"})
+            save_env(updates)
+            log("MQTT settings saved: %s as %r, prefix %s" % (
+                updates["MQTT_SERVER"], updates["MQTT_USERNAME"], updates["MQTT_TOPIC_PREFIX"]))
+            started = JOBS.start("Apply MQTT settings", job_apply_mqtt, updates)
+        elif path == "connect":
+            ssid = str(body.get("ssid", "")).strip()
+            if not ssid:
+                return self.send(400, {"error": "choose a network"})
+            started = JOBS.start("Connect to %s" % ssid, job_connect, ssid, str(body.get("password", "")))
+        elif path in ACTIONS:
+            started = JOBS.start(*ACTIONS[path])
+        else:
+            return self.send(404, {"error": "not found"})
+        self.send(200 if started else 409, {"started": started} if started else
+                  {"error": "another action is still running"})
+
+def main():
+    global FEED, PING, JOBS
+    syslog.openlog("phev-web")
+    FEED, PING, JOBS = Feed(load_env()), CarPing(), Jobs()
+    FEED.start(); PING.start()
+    log("listening on port %d" % PORT)
+    ThreadingHTTPServer(("", PORT), Handler).serve_forever()
+
+if __name__ == "__main__":
+    sys.exit(main())
